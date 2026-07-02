@@ -32,17 +32,6 @@ module.exports = {
         ],
       }
     },
-    // Install PyTorch (GPU-aware, cross-platform) via torch.js
-    {
-      method: "script.start",
-      params: {
-        uri: "torch.js",
-        params: {
-          venv: "env",
-          path: "."
-        }
-      }
-    },
     {
       method: "notify",
       params: {

@@ -135,7 +135,7 @@ def _safe_name(name: str) -> str:
 
 def _expand_urls(raw: str):
     """Turn the textbox into individual entries, expanding playlists."""
-    urls = [u.strip() for u in raw.replace(",", "\n").splitlines() if u.strip()]
+    urls = [u.strip() for u in raw.splitlines() if u.strip()]
     entries = []
     flat_opts = {"quiet": True, "skip_download": True, "extract_flat": True, "no_warnings": True}
     with yt_dlp.YoutubeDL(flat_opts) as ydl:
@@ -195,7 +195,16 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
         return "Add at least one YouTube URL or upload an audio/video file.", [], None, ""
 
     progress(0.05, desc=f"Loading {model_size} model...")
-    model = get_model(model_size, device_choice)
+    try:
+        model = get_model(model_size, device_choice)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            f"Could not load the {model_size} model on device '{device_choice}': "
+            f"{str(exc)[:200]}",
+            [],
+            None,
+            "",
+        )
 
     run_dir = os.path.join(OUTPUT_DIR, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
@@ -241,6 +250,10 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
 
             content = _render(segments, info, title, fmt)
             out_path = os.path.join(run_dir, f"{_safe_name(title)}.{fmt}")
+            n_dup = 1
+            while os.path.exists(out_path):
+                n_dup += 1
+                out_path = os.path.join(run_dir, f"{_safe_name(title)}_{n_dup}.{fmt}")
             with open(out_path, "w", encoding="utf-8") as fh:
                 fh.write(content)
             files.append(out_path)
@@ -262,6 +275,15 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     n = len(files)
+    if n == 0:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        progress(1.0, desc="Complete")
+        return (
+            f"No transcripts produced (0/{total}). See the results table for errors.",
+            log_rows,
+            None,
+            "",
+        )
     if n == 1:
         summary = (
             f"Done. 1/{total} transcribed ({last_title[:60]} — {last_lang}). "
@@ -337,8 +359,7 @@ def build_interface():
 
 def main():
     parser = argparse.ArgumentParser(description="Transcribr — Bulk Audio & Video Transcriber")
-    default_host = "127.0.0.1" if sys.platform == "win32" else "0.0.0.0"
-    parser.add_argument("--host", type=str, default=os.getenv("GRADIO_SERVER_NAME", default_host))
+    parser.add_argument("--host", type=str, default=os.getenv("GRADIO_SERVER_NAME", "127.0.0.1"))
     parser.add_argument(
         "--port",
         type=int,

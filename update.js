@@ -28,16 +28,6 @@ module.exports = {
           "uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12"
         ]
       }
-    },
-    {
-      method: "script.start",
-      params: {
-        uri: "torch.js",
-        params: {
-          venv: "env",
-          path: "."
-        }
-      }
     }
   ]
 }
