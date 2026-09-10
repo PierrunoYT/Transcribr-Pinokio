@@ -9,11 +9,13 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import traceback
 from datetime import datetime
 
@@ -35,15 +37,24 @@ OUTPUT_FORMATS = ["txt", "srt", "vtt", "json"]
 
 # faster-whisper bundles no ffmpeg, and yt-dlp wants one for some streams, so
 # point both at the binary shipped by imageio-ffmpeg for a portable install.
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-os.environ.setdefault("PATH", "")
-os.environ["PATH"] = os.path.dirname(FFMPEG_EXE) + os.pathsep + os.environ["PATH"]
+try:
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:  # noqa: BLE001 - fall back to whatever is on PATH
+    FFMPEG_EXE = shutil.which("ffmpeg") or "ffmpeg"
+
+_FFMPEG_DIR = os.path.dirname(FFMPEG_EXE)
+if _FFMPEG_DIR:
+    os.environ["PATH"] = _FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
 
 # ---------------------------------------------------------------------------
 # Model cache
 # ---------------------------------------------------------------------------
 
+# faster-whisper models are expensive (GPU/CPU memory), and a WhisperModel is not
+# safe to use from several threads at once, so keep exactly one loaded and guard it.
 _MODEL_CACHE = {}
+_MODEL_LOCK = threading.Lock()
+TRANSCRIBE_LOCK = threading.Lock()
 
 
 def _pick_device(requested: str):
@@ -66,9 +77,14 @@ def _pick_device(requested: str):
 def get_model(size: str, device_choice: str) -> WhisperModel:
     device, compute_type = _pick_device(device_choice)
     key = (size, device, compute_type)
-    if key not in _MODEL_CACHE:
-        _MODEL_CACHE[key] = WhisperModel(size, device=device, compute_type=compute_type)
-    return _MODEL_CACHE[key]
+    with _MODEL_LOCK:
+        if key not in _MODEL_CACHE:
+            model = WhisperModel(size, device=device, compute_type=compute_type)
+            # Drop any previously loaded model before keeping the new one so that
+            # switching sizes/devices does not pile up several GB of weights.
+            _MODEL_CACHE.clear()
+            _MODEL_CACHE[key] = model
+        return _MODEL_CACHE[key]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +133,7 @@ def _render(segments, info, title, fmt: str) -> str:
         return json.dumps(
             {
                 "title": title,
-                "language": info.language,
+                "language": info.language or "unknown",
                 "duration": info.duration,
                 "segments": segments,
             },
@@ -127,10 +143,21 @@ def _render(segments, info, title, fmt: str) -> str:
     return "\n".join(seg["text"].strip() for seg in segments).strip()
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def _safe_name(name: str) -> str:
     keep = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     cleaned = "".join(c if c in keep else "_" for c in name).strip()
-    return (cleaned or "transcript")[:120]
+    # Windows rejects names ending in a dot or a space.
+    cleaned = cleaned[:120].rstrip(". ")
+    if not cleaned or cleaned.upper() in _WINDOWS_RESERVED:
+        return "transcript"
+    return cleaned
 
 
 def _expand_urls(raw: str):
@@ -169,9 +196,32 @@ def _download_audio(url: str, dest_dir: str):
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
+        path = _downloaded_path(ydl, info, dest_dir)
     title = info.get("title") or info.get("id") or "audio"
     return path, title
+
+
+def _downloaded_path(ydl, info, dest_dir: str) -> str:
+    """Resolve the file yt-dlp actually wrote.
+
+    ``prepare_filename`` returns the *pre*-processing name, which is wrong as
+    soon as yt-dlp merges or remuxes (e.g. ``.webm`` on disk vs ``.mkv``
+    reported), so prefer the path yt-dlp records for the finished download.
+    """
+    for entry in info.get("requested_downloads") or []:
+        actual = entry.get("filepath") or entry.get("_filename")
+        if actual and os.path.exists(actual):
+            return actual
+
+    guess = ydl.prepare_filename(info)
+    if os.path.exists(guess):
+        return guess
+
+    matches = glob.glob(os.path.splitext(guess)[0] + ".*")
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(f"yt-dlp reported no output file in {dest_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -184,15 +234,28 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
     progress(0, desc="Collecting inputs...")
     # Build a unified job list: YouTube URLs (need downloading) + uploaded files.
     jobs = []  # each: (kind, ref) where kind in {"url", "file"}
+    seen = set()
+
+    def _add(kind, ref):
+        if ref and (kind, ref) not in seen:
+            seen.add((kind, ref))
+            jobs.append((kind, ref))
+
     if urls_text and urls_text.strip():
-        jobs.extend(("url", u) for u in _expand_urls(urls_text))
+        for u in _expand_urls(urls_text):
+            _add("url", u)
     for up in uploads or []:
         path = up if isinstance(up, str) else getattr(up, "name", None)
         if path and os.path.exists(path):
-            jobs.append(("file", path))
+            _add("file", path)
 
     if not jobs:
-        return "Add at least one YouTube URL or upload an audio/video file.", [], None, ""
+        return (
+            "Add at least one YouTube URL or upload an audio/video file.",
+            [["-", "no input", "Nothing to transcribe"]],
+            None,
+            "",
+        )
 
     progress(0.05, desc=f"Loading {model_size} model...")
     try:
@@ -201,13 +264,18 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
         return (
             f"Could not load the {model_size} model on device '{device_choice}': "
             f"{str(exc)[:200]}",
-            [],
+            [["-", "model load failed", str(exc)[:200]]],
             None,
             "",
         )
 
-    run_dir = os.path.join(OUTPUT_DIR, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(run_dir, exist_ok=True)
+    stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = os.path.join(OUTPUT_DIR, stamp)
+    suffix = 1
+    while os.path.exists(run_dir) or os.path.exists(run_dir + ".zip"):
+        suffix += 1
+        run_dir = os.path.join(OUTPUT_DIR, f"{stamp}_{suffix}")
+    os.makedirs(run_dir)
 
     log_rows = []
     files = []
@@ -234,10 +302,12 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
 
             progress(frac, desc=f"[{idx + 1}/{total}] Transcribing {title[:40]}...")
             try:
-                seg_iter, info = model.transcribe(audio_path, language=language)
-                segments = [
-                    {"start": s.start, "end": s.end, "text": s.text} for s in seg_iter
-                ]
+                with TRANSCRIBE_LOCK:
+                    seg_iter, info = model.transcribe(audio_path, language=language)
+                    segments = [
+                        {"start": s.start, "end": s.end, "text": s.text}
+                        for s in seg_iter
+                    ]
             except Exception as exc:  # noqa: BLE001
                 log_rows.append([title, "transcription failed", str(exc)[:200]])
                 continue
@@ -248,19 +318,21 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
                     except OSError:
                         pass
 
+            detected = info.language or "unknown"
             content = _render(segments, info, title, fmt)
-            out_path = os.path.join(run_dir, f"{_safe_name(title)}.{fmt}")
+            base = _safe_name(title)
+            out_path = os.path.join(run_dir, f"{base}.{fmt}")
             n_dup = 1
             while os.path.exists(out_path):
                 n_dup += 1
-                out_path = os.path.join(run_dir, f"{_safe_name(title)}_{n_dup}.{fmt}")
+                out_path = os.path.join(run_dir, f"{base}_{n_dup}.{fmt}")
             with open(out_path, "w", encoding="utf-8") as fh:
                 fh.write(content)
             files.append(out_path)
             last_content = content
             last_title = title
-            last_lang = info.language
-            log_rows.append([title, f"ok ({info.language})", f"{len(segments)} segments"])
+            last_lang = detected
+            log_rows.append([title, f"ok ({detected})", f"{len(segments)} segments"])
 
         progress(0.97, desc="Packaging results...")
         zip_path = None
@@ -353,6 +425,7 @@ def build_interface():
             transcribe_bulk,
             inputs=[urls, uploads, model_size, device_choice, language, fmt],
             outputs=[status, results, download, transcript_box],
+            concurrency_limit=1,
         )
     return app
 
