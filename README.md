@@ -14,15 +14,17 @@ files.
 - Downloads the best audio with `yt-dlp` (bundled `ffmpeg`, no system install).
 - Transcribes each item with a Whisper model (`tiny` → `large-v3`).
 - Runs on **GPU** (NVIDIA, automatic) or **CPU**.
-- Exports each transcript as **txt**, **srt**, **vtt**, or **json** and bundles
-  them into a downloadable `.zip`.
+- Exports each transcript as **txt**, **srt**, **vtt**, or **json** — a single
+  transcript is shown inline and downloadable as-is, several are bundled into a
+  `.zip`.
 
 ## How to use
 
 1. Click **Install** (installs dependencies; Whisper models download on first run).
 2. Click **Start**, then open the Web UI.
 3. Paste YouTube URLs and/or upload audio/video files, then choose a model size, device, language, and output format.
-4. Click **Transcribe**. Results appear in the table and a `.zip` download.
+4. Click **Transcribe**. Results appear in the table; one transcript is shown
+   in the text box, several arrive as a `.zip` download.
 
 Transcripts are also saved under `app/transcripts/run_<timestamp>/`.
 
@@ -50,7 +52,9 @@ url = "https://www.youtube.com/watch?v=VIDEO_ID"
 opts = {"format": "bestaudio/best", "outtmpl": "audio.%(ext)s", "noplaylist": True}
 with yt_dlp.YoutubeDL(opts) as ydl:
     info = ydl.extract_info(url, download=True)
-    audio = ydl.prepare_filename(info)
+    # prepare_filename() reports the pre-processing name; the finished file is
+    # recorded under requested_downloads.
+    audio = info["requested_downloads"][0]["filepath"]
 
 model = WhisperModel("small", device="auto", compute_type="int8")
 segments, info = model.transcribe(audio)
@@ -59,6 +63,9 @@ print("".join(seg.text for seg in segments))
 
 ### JavaScript (Node)
 
+There is no JavaScript transcription engine here — shell out to the same Python
+tools that this app installs into its `env` virtualenv.
+
 ```javascript
 import { spawnSync } from "node:child_process";
 
@@ -66,9 +73,12 @@ import { spawnSync } from "node:child_process";
 spawnSync("yt-dlp", ["-f", "bestaudio/best", "-o", "audio.%(ext)s",
   "https://www.youtube.com/watch?v=VIDEO_ID"], { stdio: "inherit" });
 
-// Transcribe with the bundled CLI
-spawnSync("whisper-ctranslate2", ["audio.webm", "--model", "small",
-  "--output_format", "srt"], { stdio: "inherit" });
+// Transcribe with faster-whisper
+spawnSync("python", ["-c", `
+from faster_whisper import WhisperModel
+segments, info = WhisperModel("small", compute_type="int8").transcribe("audio.webm")
+print("".join(s.text for s in segments))
+`], { stdio: "inherit" });
 ```
 
 ### Curl

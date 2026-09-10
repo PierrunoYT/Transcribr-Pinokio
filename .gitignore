@@ -8,3 +8,9 @@ __pycache__/
 
 # Local-only logo prompt notes
 LOGO_PROMPT*.md
+
+# Local agent / tooling scratch directories
+.claude/
+.codex/
+.gemini/
+.open-edit/
