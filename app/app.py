@@ -90,18 +90,32 @@ _MODEL_LOCK = threading.Lock()
 TRANSCRIBE_LOCK = threading.Lock()
 
 
+def _cuda_compute_type() -> str:
+    """float16 where the GPU supports it; older cards (e.g. GTX 10xx) reject it."""
+    try:
+        import ctranslate2
+
+        supported = ctranslate2.get_supported_compute_types("cuda")
+    except Exception:
+        return "float16"
+    for candidate in ("float16", "int8_float32", "float32"):
+        if candidate in supported:
+            return candidate
+    return "float32"
+
+
 def _pick_device(requested: str):
     """Resolve the (device, compute_type) pair for CTranslate2."""
     if requested == "cpu":
         return "cpu", "int8"
     if requested == "cuda":
-        return "cuda", "float16"
+        return "cuda", _cuda_compute_type()
     # auto
     try:
         import ctranslate2
 
         if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda", "float16"
+            return "cuda", _cuda_compute_type()
     except Exception:
         pass
     return "cpu", "int8"
