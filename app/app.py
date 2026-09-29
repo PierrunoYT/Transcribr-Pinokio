@@ -19,10 +19,43 @@ import threading
 import traceback
 from datetime import datetime
 
-import gradio as gr
-import imageio_ffmpeg
-import yt_dlp
-from faster_whisper import WhisperModel
+
+def _register_nvidia_libs():
+    """Make the pip-installed cuBLAS / cuDNN libraries visible to CTranslate2.
+
+    ``nvidia-cublas-cu12`` and ``nvidia-cudnn-cu12`` unpack their libraries into
+    ``site-packages/nvidia/*/{bin,lib}``, which is not on any loader search path.
+    Must run before CTranslate2 loads CUDA.
+    """
+    try:
+        import nvidia  # namespace package provided by the nvidia-* wheels
+    except ImportError:
+        return
+    roots = list(getattr(nvidia, "__path__", []))
+
+    if sys.platform == "win32":
+        for root in roots:
+            for lib_dir in glob.glob(os.path.join(root, "*", "bin")):
+                os.add_dll_directory(lib_dir)
+                os.environ["PATH"] = lib_dir + os.pathsep + os.environ.get("PATH", "")
+    elif sys.platform.startswith("linux"):
+        # The dynamic loader reads LD_LIBRARY_PATH only at process start, so
+        # re-exec once with the library directories added.
+        lib_dirs = [d for root in roots for d in glob.glob(os.path.join(root, "*", "lib"))]
+        current = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        missing = [d for d in lib_dirs if d not in current]
+        if missing and not os.environ.get("TRANSCRIBR_LIBS_SET"):
+            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(missing + [p for p in current if p])
+            os.environ["TRANSCRIBR_LIBS_SET"] = "1"
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_register_nvidia_libs()
+
+import gradio as gr  # noqa: E402
+import imageio_ffmpeg  # noqa: E402
+import yt_dlp  # noqa: E402
+from faster_whisper import WhisperModel  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths / constants

@@ -25,7 +25,7 @@ module.exports = {
         venv: "env",
         path: ".",
         message: [
-          "uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12"
+          "uv pip install nvidia-cublas-cu12 \"nvidia-cudnn-cu12==9.*\""
         ]
       }
     }
