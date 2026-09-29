@@ -227,13 +227,23 @@ def _expand_urls(raw: str):
                 entries.append(url)
                 continue
             if meta and meta.get("entries"):
+                before = len(entries)
                 for item in meta["entries"]:
                     if not item:
                         continue
-                    vid = item.get("url") or item.get("id")
+                    extractor = item.get("ie_key") or meta.get("extractor_key") or ""
+                    vid = item.get("url") or item.get("webpage_url") or item.get("id")
                     if vid and not str(vid).startswith("http"):
-                        vid = f"https://www.youtube.com/watch?v={vid}"
-                    entries.append(vid or url)
+                        # A bare id is only resolvable for YouTube entries.
+                        vid = (
+                            f"https://www.youtube.com/watch?v={vid}"
+                            if extractor.startswith("Youtube")
+                            else None
+                        )
+                    if vid:
+                        entries.append(vid)
+                if len(entries) == before:
+                    entries.append(url)  # surface it as a failed row, not silently drop it
             else:
                 entries.append(url)
     return entries
