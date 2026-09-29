@@ -526,6 +526,9 @@ def main():
         share=args.share,
         inbrowser=False,
         show_error=True,
+        # Gradio only serves files from the cwd or temp dir by default; allow the
+        # transcripts folder explicitly so downloads work from any cwd.
+        allowed_paths=[OUTPUT_DIR],
     )
 
 
