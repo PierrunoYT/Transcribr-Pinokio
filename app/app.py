@@ -69,6 +69,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 OUTPUT_FORMATS = ["txt", "srt", "vtt", "json"]
 
+try:
+    from faster_whisper.tokenizer import _LANGUAGE_CODES  # noqa: E402
+except ImportError:  # private name; skip validation if it ever moves
+    _LANGUAGE_CODES = ()
+
 # faster-whisper bundles no ffmpeg, and yt-dlp wants one for some streams, so
 # point both at the binary shipped by imageio-ffmpeg for a portable install.
 try:
@@ -278,7 +283,16 @@ def _downloaded_path(ydl, info, dest_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt, progress=gr.Progress()):
-    language = (language or "").strip() or None
+    language = (language or "").strip().lower() or None
+    # Reject a bad code up front instead of failing every item after downloading it.
+    if language and _LANGUAGE_CODES and language not in _LANGUAGE_CODES:
+        return (
+            f"Unknown language code '{language}'. Use an ISO code such as en, fr, "
+            "es, or leave it blank to auto-detect.",
+            [["-", "invalid language", language]],
+            None,
+            "",
+        )
 
     progress(0, desc="Collecting inputs...")
     # Build a unified job list: YouTube URLs (need downloading) + uploaded files.
