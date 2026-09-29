@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import gc
 import glob
 import json
 import os
@@ -126,11 +127,12 @@ def get_model(size: str, device_choice: str) -> WhisperModel:
     key = (size, device, compute_type)
     with _MODEL_LOCK:
         if key not in _MODEL_CACHE:
-            model = WhisperModel(size, device=device, compute_type=compute_type)
-            # Drop any previously loaded model before keeping the new one so that
-            # switching sizes/devices does not pile up several GB of weights.
+            # Drop any previously loaded model *before* loading the new one so
+            # that switching sizes/devices never holds two sets of weights at
+            # once (which can exhaust GPU memory).
             _MODEL_CACHE.clear()
-            _MODEL_CACHE[key] = model
+            gc.collect()
+            _MODEL_CACHE[key] = WhisperModel(size, device=device, compute_type=compute_type)
         return _MODEL_CACHE[key]
 
 
