@@ -1,7 +1,9 @@
 module.exports = {
   version: "5.0",
   menu: async (kernel, info) => {
-    let installed = info.exists("env")
+    // Written by install.js/update.js only after every install step succeeded,
+    // so a half-finished install keeps offering "Install".
+    let installed = info.exists("env/transcribr.installed")
     let running = {
       install: info.running("install.js"),
       start: info.running("start.js"),

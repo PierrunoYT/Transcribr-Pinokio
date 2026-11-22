@@ -2,9 +2,12 @@
 
 # Transcription engine (CTranslate2-based Whisper, no torch required)
 faster-whisper>=1.1.0
+# faster-whisper (<=1.2.1) passes av.open(metadata_errors=...), removed in PyAV 19.
+av>=11,<19
 
-# YouTube / media downloader
-yt-dlp>=2025.6.9
+# YouTube / media downloader. YouTube needs a JS runtime: [default] pulls the
+# pinned yt-dlp-ejs solver, [deno] ships the Deno binary into the venv.
+yt-dlp[default,deno]>=2025.11.12
 
 # Bundled ffmpeg binary so audio extraction works without a system install
 imageio-ffmpeg>=0.5.1

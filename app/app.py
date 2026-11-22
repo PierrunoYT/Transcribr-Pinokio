@@ -13,6 +13,7 @@ import gc
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -57,6 +58,7 @@ import gradio as gr  # noqa: E402
 import imageio_ffmpeg  # noqa: E402
 import yt_dlp  # noqa: E402
 from faster_whisper import WhisperModel  # noqa: E402
+from yt_dlp.extractor import gen_extractor_classes  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -74,8 +76,9 @@ try:
 except ImportError:  # private name; skip validation if it ever moves
     _LANGUAGE_CODES = ()
 
-# faster-whisper bundles no ffmpeg, and yt-dlp wants one for some streams, so
-# point both at the binary shipped by imageio-ffmpeg for a portable install.
+# yt-dlp needs ffmpeg to extract/remux some audio streams; point it at the
+# binary shipped by imageio-ffmpeg for a portable install. (faster-whisper
+# decodes with PyAV and does not use it.)
 try:
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:  # noqa: BLE001 - fall back to whatever is on PATH
@@ -89,11 +92,18 @@ if _FFMPEG_DIR:
 # Model cache
 # ---------------------------------------------------------------------------
 
-# faster-whisper models are expensive (GPU/CPU memory), and a WhisperModel is not
-# safe to use from several threads at once, so keep exactly one loaded and guard it.
+# faster-whisper models are expensive (GPU/CPU memory), so keep exactly one
+# loaded. The Gradio event runs with concurrency_limit=1, so a model is never
+# used by two jobs at once.
 _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
-TRANSCRIBE_LOCK = threading.Lock()
+
+# CTranslate2 (4.x) loads cuBLAS 12 and cuDNN 9 lazily; if they are missing it
+# aborts the whole process on the first CUDA transcription instead of raising.
+_CUDA_LIBS = {
+    "win32": ("cublas64_12.dll", "cudnn_ops64_9.dll"),
+    "linux": ("libcublas.so.12", "libcudnn_ops.so.9"),
+}
 
 
 def _cuda_compute_type() -> str:
@@ -110,17 +120,37 @@ def _cuda_compute_type() -> str:
     return "float32"
 
 
+def _cuda_libs_missing() -> list:
+    """Names of the CUDA runtime libraries CTranslate2 needs that can't be loaded."""
+    import ctypes
+
+    platform = "linux" if sys.platform.startswith("linux") else sys.platform
+    missing = []
+    for name in _CUDA_LIBS.get(platform, ()):
+        try:
+            ctypes.CDLL(name)
+        except OSError:
+            missing.append(name)
+    return missing
+
+
 def _pick_device(requested: str):
     """Resolve the (device, compute_type) pair for CTranslate2."""
     if requested == "cpu":
         return "cpu", "int8"
     if requested == "cuda":
+        missing = _cuda_libs_missing()
+        if missing:
+            raise RuntimeError(
+                "CUDA libraries not found: " + ", ".join(missing)
+                + ". Reinstall Transcribr on an NVIDIA machine, or pick device 'cpu'."
+            )
         return "cuda", _cuda_compute_type()
-    # auto
+    # auto: only use the GPU when CTranslate2 can actually run on it.
     try:
         import ctranslate2
 
-        if ctranslate2.get_cuda_device_count() > 0:
+        if ctranslate2.get_cuda_device_count() > 0 and not _cuda_libs_missing():
             return "cuda", _cuda_compute_type()
     except Exception:
         pass
@@ -205,61 +235,108 @@ _WINDOWS_RESERVED = {
 
 
 def _safe_name(name: str) -> str:
-    keep = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    cleaned = "".join(c if c in keep else "_" for c in name).strip()
+    # Keep letters/digits from any script (so non-Latin titles stay readable);
+    # replace everything else outside a small safe punctuation set.
+    cleaned = "".join(c if c.isalnum() or c in "-_.() " else "_" for c in name).strip()
     # Windows rejects names ending in a dot or a space.
     cleaned = cleaned[:120].rstrip(". ")
-    if not cleaned or cleaned.upper() in _WINDOWS_RESERVED:
+    # Windows also reserves CON, CON.txt, CON.backup.txt, ...
+    if not cleaned or cleaned.split(".")[0].rstrip().upper() in _WINDOWS_RESERVED:
         return "transcript"
     return cleaned
 
 
+# URLs these extractors match are always one video, so expanding them would
+# only cost an extra network round-trip.
+_SINGLE_VIDEO_IES = {"Youtube"}
+# Flat playlist entries from these extractors are themselves playlists
+# (channel tabs, sub-playlists, albums, ...) and need expanding again.
+_PLAYLIST_IE_RE = re.compile(r"(Tab|Playlist|Channel|User|Album|Set|Collection)$")
+_MAX_PLAYLIST_DEPTH = 3
+
+_YDL_BASE_OPTS = {
+    "quiet": True,
+    "noprogress": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    # Pinokio runs us in a terminal; keep ANSI colour codes out of error text.
+    "color": "no_color",
+}
+
+
+def _extractor_key(url: str) -> str:
+    """Key of the extractor yt-dlp would pick for ``url`` (regex only, no network)."""
+    for ie in gen_extractor_classes():
+        if ie.suitable(url):
+            return ie.ie_key()
+    return ""
+
+
+def _collect_entries(ydl, url: str, entries: list, depth: int = 0):
+    if _extractor_key(url) in _SINGLE_VIDEO_IES:
+        entries.append(url)
+        return
+    try:
+        meta = ydl.extract_info(url, download=False)
+    except Exception:
+        entries.append(url)  # surface it as a failed row later
+        return
+    if not meta or meta.get("_type") != "playlist":
+        entries.append(url)
+        return
+    for item in meta.get("entries") or []:
+        if not item:
+            continue
+        extractor = item.get("ie_key") or meta.get("extractor_key") or ""
+        vid = item.get("url") or item.get("webpage_url") or item.get("id")
+        if vid and not str(vid).startswith("http"):
+            # A bare id is only resolvable for YouTube entries.
+            vid = (
+                f"https://www.youtube.com/watch?v={vid}"
+                if extractor.startswith("Youtube")
+                else None
+            )
+        if not vid:
+            continue
+        if item.get("_type") == "playlist" or _PLAYLIST_IE_RE.search(extractor):
+            if depth < _MAX_PLAYLIST_DEPTH:
+                _collect_entries(ydl, vid, entries, depth + 1)
+        else:
+            entries.append(vid)
+
+
 def _expand_urls(raw: str):
-    """Turn the textbox into individual entries, expanding playlists."""
+    """Turn the textbox into individual entries, expanding (nested) playlists.
+
+    A video URL that merely carries a ``list=`` parameter (e.g. opened from a
+    playlist or Mix) stays a single video.
+    """
     urls = [u.strip() for u in raw.splitlines() if u.strip()]
     entries = []
-    flat_opts = {"quiet": True, "skip_download": True, "extract_flat": True, "no_warnings": True}
+    flat_opts = {**_YDL_BASE_OPTS, "skip_download": True, "extract_flat": "in_playlist"}
     with yt_dlp.YoutubeDL(flat_opts) as ydl:
         for url in urls:
-            try:
-                meta = ydl.extract_info(url, download=False)
-            except Exception:
-                entries.append(url)
-                continue
-            if meta and meta.get("entries"):
-                before = len(entries)
-                for item in meta["entries"]:
-                    if not item:
-                        continue
-                    extractor = item.get("ie_key") or meta.get("extractor_key") or ""
-                    vid = item.get("url") or item.get("webpage_url") or item.get("id")
-                    if vid and not str(vid).startswith("http"):
-                        # A bare id is only resolvable for YouTube entries.
-                        vid = (
-                            f"https://www.youtube.com/watch?v={vid}"
-                            if extractor.startswith("Youtube")
-                            else None
-                        )
-                    if vid:
-                        entries.append(vid)
-                if len(entries) == before:
-                    entries.append(url)  # surface it as a failed row, not silently drop it
-            else:
-                entries.append(url)
+            before = len(entries)
+            _collect_entries(ydl, url, entries)
+            if len(entries) == before:
+                entries.append(url)  # surface it as a failed row, not silently drop it
     return entries
 
 
 def _download_audio(url: str, dest_dir: str):
     opts = {
+        **_YDL_BASE_OPTS,
         "format": "bestaudio/best",
         "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
         "ffmpeg_location": FFMPEG_EXE,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        # Resolve first so an unexpanded playlist fails fast instead of
+        # downloading every entry into the temp folder.
+        info = ydl.extract_info(url, download=False)
+        if info.get("_type") == "playlist" or "entries" in info:
+            raise ValueError("this URL is a playlist that could not be expanded into videos")
+        info = ydl.process_ie_result(info, download=True)
         path = _downloaded_path(ydl, info, dest_dir)
     title = info.get("title") or info.get("id") or "audio"
     return path, title
@@ -375,12 +452,11 @@ def transcribe_bulk(urls_text, uploads, model_size, device_choice, language, fmt
 
             progress(frac, desc=f"[{idx + 1}/{total}] Transcribing {title[:40]}...")
             try:
-                with TRANSCRIBE_LOCK:
-                    seg_iter, info = model.transcribe(audio_path, language=language)
-                    segments = [
-                        {"start": s.start, "end": s.end, "text": s.text}
-                        for s in seg_iter
-                    ]
+                seg_iter, info = model.transcribe(audio_path, language=language)
+                segments = [
+                    {"start": s.start, "end": s.end, "text": s.text}
+                    for s in seg_iter
+                ]
             except Exception as exc:  # noqa: BLE001
                 log_rows.append([title, "transcription failed", str(exc)[:200]])
                 continue
@@ -499,6 +575,7 @@ def build_interface():
             inputs=[urls, uploads, model_size, device_choice, language, fmt],
             outputs=[status, results, download, transcript_box],
             concurrency_limit=1,
+            api_name="transcribe",
         )
     return app
 

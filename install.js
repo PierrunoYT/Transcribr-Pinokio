@@ -18,6 +18,10 @@ module.exports = {
         message: [
           "uv pip install -r app/requirements.txt"
         ],
+        on: [{
+          event: "/error:/i",
+          break: true
+        }]
       }
     },
     // NVIDIA GPU acceleration: faster-whisper (CTranslate2) needs cuBLAS + cuDNN
@@ -30,6 +34,18 @@ module.exports = {
         message: [
           "uv pip install nvidia-cublas-cu12 \"nvidia-cudnn-cu12==9.*\""
         ],
+        on: [{
+          event: "/error:/i",
+          break: true
+        }]
+      }
+    },
+    // Only reached when every install step succeeded; pinokio.js keys on it.
+    {
+      method: "fs.write",
+      params: {
+        path: "env/transcribr.installed",
+        text: "ok"
       }
     },
     {

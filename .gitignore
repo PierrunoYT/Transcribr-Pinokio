@@ -1,6 +1,6 @@
 env/
 app/transcripts/
-app/models/
+logs/
 
 # Python bytecode
 __pycache__/
@@ -10,7 +10,10 @@ __pycache__/
 LOGO_PROMPT*.md
 
 # Local agent / tooling scratch directories
+.agents/
 .claude/
 .codex/
 .gemini/
 .open-edit/
+package.json
+package-lock.json

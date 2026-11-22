@@ -11,7 +11,9 @@ files.
 
 - Paste any number of YouTube video **or** playlist URLs (one per line).
 - **Or upload your own audio/video files** to transcribe them directly.
-- Downloads the best audio with `yt-dlp` (bundled `ffmpeg`, no system install).
+- Downloads the best audio with `yt-dlp` (bundled `ffmpeg` and Deno JS runtime,
+  no system install). A video link that carries a `list=` parameter stays a
+  single video; playlist and channel URLs expand to every video.
 - Transcribes each item with a Whisper model (`tiny` → `large-v3`).
 - Runs on **GPU** (NVIDIA, automatic) or **CPU**.
 - Exports each transcript as **txt**, **srt**, **vtt**, or **json** — a single
@@ -39,56 +41,54 @@ Transcripts are also saved under `app/transcripts/run_<timestamp>/`.
 
 ## Programmatic access
 
-The transcription engine is plain `faster-whisper` + `yt-dlp`, so you can script
-the same pipeline directly.
+While the app is running it exposes its Transcribe action as a Gradio API
+endpoint named `/transcribe`. Replace `http://127.0.0.1:PORT` with the URL
+shown in Pinokio. Inputs, in order: URLs (newline-separated), uploaded files,
+model size, device, language, output format. Outputs: status message, results
+table, download file, transcript text.
 
 ### Python
 
 ```python
-import yt_dlp
-from faster_whisper import WhisperModel
+from gradio_client import Client, handle_file
 
-url = "https://www.youtube.com/watch?v=VIDEO_ID"
-opts = {"format": "bestaudio/best", "outtmpl": "audio.%(ext)s", "noplaylist": True}
-with yt_dlp.YoutubeDL(opts) as ydl:
-    info = ydl.extract_info(url, download=True)
-    # prepare_filename() reports the pre-processing name; the finished file is
-    # recorded under requested_downloads.
-    audio = info["requested_downloads"][0]["filepath"]
-
-model = WhisperModel("small", device="auto", compute_type="int8")
-segments, info = model.transcribe(audio)
-print("".join(seg.text for seg in segments))
+client = Client("http://127.0.0.1:PORT/")
+status, results, download, text = client.predict(
+    "https://www.youtube.com/watch?v=VIDEO_ID",  # URLs, one per line
+    [],  # or [handle_file("talk.mp3")] to upload local files
+    "small",  # model size
+    "auto",  # device
+    "",  # language ("" = auto-detect)
+    "txt",  # output format
+    api_name="/transcribe",
+)
+print(text)
 ```
 
-### JavaScript (Node)
-
-There is no JavaScript transcription engine here — shell out to the same Python
-tools that this app installs into its `env` virtualenv.
+### JavaScript
 
 ```javascript
-import { spawnSync } from "node:child_process";
+import { Client } from "@gradio/client";
 
-// Download audio
-spawnSync("yt-dlp", ["-f", "bestaudio/best", "-o", "audio.%(ext)s",
-  "https://www.youtube.com/watch?v=VIDEO_ID"], { stdio: "inherit" });
-
-// Transcribe with faster-whisper
-spawnSync("python", ["-c", `
-from faster_whisper import WhisperModel
-segments, info = WhisperModel("small", compute_type="int8").transcribe("audio.webm")
-print("".join(s.text for s in segments))
-`], { stdio: "inherit" });
+const client = await Client.connect("http://127.0.0.1:PORT/");
+const result = await client.predict("/transcribe", [
+  "https://www.youtube.com/watch?v=VIDEO_ID", [], "small", "auto", "", "txt",
+]);
+const [status, results, download, text] = result.data;
+console.log(text);
 ```
 
 ### Curl
 
-`yt-dlp` and `faster-whisper` are local tools, not an HTTP API. To fetch a
-single video's audio without this app:
-
 ```bash
-yt-dlp -f bestaudio/best -o "audio.%(ext)s" "https://www.youtube.com/watch?v=VIDEO_ID"
+EVENT_ID=$(curl -s -X POST http://127.0.0.1:PORT/gradio_api/call/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"data": ["https://www.youtube.com/watch?v=VIDEO_ID", [], "small", "auto", "", "txt"]}' \
+  | sed 's/.*"event_id": *"\([^"]*\)".*/\1/')
+curl -N http://127.0.0.1:PORT/gradio_api/call/transcribe/$EVENT_ID
 ```
+
+The final `event: complete` line carries the four outputs as JSON.
 
 ## Requirements
 
