@@ -15,5 +15,8 @@ LOGO_PROMPT*.md
 .codex/
 .gemini/
 .open-edit/
+node_modules/
+runs/
+.open-edit-prefs.json
 package.json
 package-lock.json
